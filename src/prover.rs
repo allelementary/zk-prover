@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self};
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Inputs {
     pub price_start: String,
     pub price_end: String,
@@ -19,38 +19,36 @@ pub struct ProofResult {
     pub public_inputs: Vec<String>,
 }
 
-/// Generate a ZK proof from a Noir circuit using nargo and Barretenberg CLI.
-///
-/// # Arguments
-/// * `input_path` - Path to the input.json file
-/// * `circuit_dir` - Root directory of the Noir project
-/// * `profile_path` - Path to the custom profile TOML for nargo
-/// * `circuit_name` - The name of the compiled circuit (used for file lookup)
-///
-/// # Returns
-/// `ProofResult` containing the proof bytes and public inputs (empty for now)
 pub fn generate_proof_from_file(
-    input_path: &str,
+    inputs: &Inputs,
     circuit_dir: &str,
-    profile_path: &str,
+    profile_name: &str,
     circuit_name: &str,
 ) -> Result<ProofResult> {
-    let input_dest = Path::new(circuit_dir).join("inputs/input.json");
-    let target_dir = Path::new(circuit_dir).join("target");
-    let proof_dir = target_dir.join("proof");
+    let profile_path = Path::new(circuit_dir).join(profile_name);
+    let compiled_dir = Path::new(circuit_dir).join("target");
+    let json_path = compiled_dir.join(format!("{circuit_name}.json"));
+    let witness_path = compiled_dir.join(format!("{circuit_name}.gz"));
+    let proof_path = compiled_dir.join("proof");
+    let vk_dir = compiled_dir.join("vk");
+    let vk_path = vk_dir.join("vk");
+    let verifier_path = compiled_dir.join("Verifier.sol");
 
-    // Step 1: Copy input.json
-    fs::create_dir_all(input_dest.parent().unwrap())
-        .context("Failed to create inputs directory")?;
-    fs::copy(input_path, &input_dest).context("Failed to copy input.json")?;
+    if vk_dir.exists() && vk_dir.is_dir() {
+        fs::remove_dir_all(&vk_dir).context("Failed to remove vk directory")?;
+    }
+    fs::create_dir_all(&vk_dir).context("Failed to create vk directory")?;
 
-    // Step 2: Run `nargo execute`
+    println!("🔧 Writing inputs to profile: {}", profile_path.display());
+    let toml_str = toml::to_string(inputs).context("Failed to serialize inputs to TOML")?;
+    fs::write(&profile_path, toml_str).context("Failed to write TOML input file")?;
+
+    println!("⚙️ Running nargo execute...");
     let output = Command::new("nargo")
-        .args(["execute", "-p", profile_path])
+        .args(["execute", "-p", profile_name])
         .current_dir(circuit_dir)
         .output()
         .context("Failed to run nargo execute")?;
-
     if !output.status.success() {
         return Err(anyhow!(
             "nargo execute failed: {}",
@@ -58,29 +56,20 @@ pub fn generate_proof_from_file(
         ));
     }
 
-    // Step 3: Run `bb prove`
-    if proof_dir.exists() && !proof_dir.is_dir() {
-        fs::remove_file(&proof_dir).context("Failed to remove file named 'proof'")?;
-    }
-    fs::create_dir_all(&proof_dir).context("Failed to create proof directory")?;
-
+    println!("📦 Running bb prove...");
     let output = Command::new("bb")
         .args([
             "prove",
             "-b",
-            &target_dir
-                .join(format!("{}.json", circuit_name))
-                .to_string_lossy(),
+            &json_path.to_string_lossy(),
             "-w",
-            &target_dir
-                .join(format!("{}.gz", circuit_name))
-                .to_string_lossy(),
+            &witness_path.to_string_lossy(),
             "-o",
-            &proof_dir.to_string_lossy(),
+            &compiled_dir.to_string_lossy(),
         ])
+        .current_dir(circuit_dir)
         .output()
         .context("Failed to run bb prove")?;
-
     if !output.status.success() {
         return Err(anyhow!(
             "bb prove failed: {}",
@@ -88,14 +77,69 @@ pub fn generate_proof_from_file(
         ));
     }
 
-    // Step 4: Read proof
-    let proof = fs::read(proof_dir.join("proof")).context("Failed to read proof file")?;
+    println!("📄 Reading generated proof...");
+    let proof = fs::read(&proof_path).context("Failed to read proof file")?;
 
-    // Step 5: Placeholder for public inputs
-    let public_inputs = vec![];
+    println!("🔐 Generating verification key...");
+    let output = Command::new("bb")
+        .args([
+            "write_vk",
+            "-b",
+            &json_path.to_string_lossy(),
+            "-o",
+            &vk_dir.to_string_lossy(),
+        ])
+        .current_dir(circuit_dir)
+        .output()
+        .context("Failed to run bb write_vk")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "bb write_vk failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
 
+    println!("✅ Verifying proof...");
+    let output = Command::new("bb")
+        .args([
+            "verify",
+            "-k",
+            &vk_path.to_string_lossy(),
+            "-p",
+            &proof_path.to_string_lossy(),
+        ])
+        .current_dir(circuit_dir)
+        .output()
+        .context("Failed to run bb verify")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "bb verify failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    println!("📝 Generating Solidity verifier...");
+    let output = Command::new("bb")
+        .args([
+            "write_solidity_verifier",
+            "-k",
+            &vk_path.to_string_lossy(),
+            "-o",
+            &verifier_path.to_string_lossy(),
+        ])
+        .current_dir(circuit_dir)
+        .output()
+        .context("Failed to run bb write_solidity_verifier")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "bb write_solidity_verifier failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    println!("✅ ZK proof generation complete.");
     Ok(ProofResult {
         proof,
-        public_inputs,
+        public_inputs: vec![],
     })
 }
